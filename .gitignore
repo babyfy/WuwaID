@@ -142,9 +142,31 @@ _ReSharper*/
 *.VC.nativecodeanalysis.all.xml
 
 # ============================================================
-# Python compiled files
+# Python compiled files & virtual environments
 # ============================================================
 __pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ============================================================
+# Node / Web / JS dependencies & builds
+# ============================================================
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.vite/
+**/.vite/
+.env
+.env.*
+!.env.example
 
 # ============================================================
 # CMake
@@ -200,17 +222,18 @@ export_text_grouped/
 Javascript/*
 WuwaDBExport*/
 data/db_exports/
+data/quests/
+# Local WebUI row snapshots; source version history and manifests are tracked.
+data/version_history.db*
+webui/data/db_uploads/
+scripts/export_quest_ordered/
 export_quest_raw_all/
 experiments/
 build-artifacts/
 .codegraph/
 .pi-subagents/
 
-# Python caches
-__pycache__/
-*.py[cod]
-*$py.class
-
 # Agent workspace files
 CLAUDE.md
 docs/agents/
+.pi-glla/

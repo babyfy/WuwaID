@@ -19,6 +19,8 @@ Output structure:
       others.json            (misc small groups)
 """
 
+import argparse
+import hashlib
 import sqlite3
 import os
 import json
@@ -29,16 +31,24 @@ import shutil
 import glob
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CONFIG_DB_DIR = None
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "export_text_grouped")
-QUEST_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "export_quest_ordered")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(REPO_ROOT, "data", "quests")
+QUEST_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "quests")
 CATEGORIES_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "categories")
+CATEGORIES_MANIFEST_FILE = os.path.join(OUTPUT_DIR, "categories.json")
+INDEX_DB_FILE = os.path.join(OUTPUT_DIR, "index.db")
+VERSION_HISTORY_FILE = os.path.join(REPO_ROOT, "data", "version_history.json")
+VERSION_MANIFEST_DIR = os.path.join(REPO_ROOT, "data", "version_manifests")
 LANGUAGES = ["zh-Hans", "en", "ja"]
+CATEGORY_MIN_ITEMS = 25
+CATEGORY_MAX_CHILDREN = 64
+CATEGORY_MAX_DEPTH = 3
 
 # Track all dialogue keys exported in the quest-ordered step to exclude from groups
 exported_dialogue_keys = set()
@@ -80,7 +90,187 @@ def open_db_first_existing(*rel_paths: str) -> sqlite3.Connection:
 
 
 def safe_makedirs(path: str):
-    os.makedirs(path, exist_ok=True)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Failed creating directory {path}: {exc}") from exc
+
+
+def safe_rmtree(path: str):
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
+def write_json(path: str, value):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        raise RuntimeError(f"Failed writing {path}: {exc}") from exc
+
+
+def build_db_manifest(config_db_dir: str) -> dict[str, dict[str, int | str]]:
+    """Hash every exported database so game-data versions are reproducible."""
+    manifest: dict[str, dict[str, int | str]] = {}
+    for dirpath, _, filenames in os.walk(config_db_dir):
+        for filename in sorted(filenames):
+            if not filename.lower().endswith(".db"):
+                continue
+
+            file_path = os.path.join(dirpath, filename)
+            relative_path = os.path.relpath(file_path, config_db_dir).replace(os.sep, "/")
+            digest = hashlib.sha256()
+            with open(file_path, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+
+            manifest[relative_path] = {
+                "sha256": digest.hexdigest(),
+                "bytes": os.path.getsize(file_path),
+            }
+
+    return dict(sorted(manifest.items()))
+
+
+def _load_json_list(path: str) -> list[dict]:
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as source:
+            value = json.load(source)
+        return value if isinstance(value, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _load_version_manifest(version: dict) -> dict[str, dict[str, int | str]]:
+    relative_path = version.get("manifestPath")
+    if not isinstance(relative_path, str):
+        return {}
+
+    manifest_path = os.path.join(REPO_ROOT, relative_path)
+    try:
+        with open(manifest_path, encoding="utf-8") as source:
+            payload = json.load(source)
+        files = payload.get("files") if isinstance(payload, dict) else None
+        return files if isinstance(files, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _version_filename(version_tag: str) -> str:
+    safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", version_tag).strip("._")
+    return safe_tag or "version"
+
+
+def _compare_manifests(
+    previous: dict[str, dict[str, int | str]],
+    current: dict[str, dict[str, int | str]],
+) -> tuple[list[str], list[str], list[str], dict[str, dict[str, int]]]:
+    previous_paths = set(previous)
+    current_paths = set(current)
+    added = sorted(current_paths - previous_paths)
+    removed = sorted(previous_paths - current_paths)
+    changed = sorted(
+        path for path in current_paths & previous_paths
+        if current[path].get("sha256") != previous[path].get("sha256")
+    )
+
+    locale_stats: dict[str, dict[str, int]] = {}
+    for relative_path in sorted(current_paths | previous_paths):
+        locale = relative_path.split("/", 1)[0]
+        stats = locale_stats.setdefault(locale, {"changed": 0, "added": 0, "removed": 0})
+        if relative_path in added:
+            stats["added"] += 1
+        elif relative_path in removed:
+            stats["removed"] += 1
+        elif relative_path in changed:
+            stats["changed"] += 1
+
+    return changed, added, removed, locale_stats
+
+
+def record_data_version(
+    config_db_dir: str,
+    version_tag: str,
+    author: str,
+    description: str | None,
+    manifest: dict[str, dict[str, int | str]] | None = None,
+) -> dict:
+    """Persist a source-database snapshot and its diff from the prior version."""
+    current_manifest = manifest or build_db_manifest(config_db_dir)
+    history = _load_json_list(VERSION_HISTORY_FILE)
+    previous_version = next(
+        (item for item in history if item.get("versionTag") != version_tag), None
+    )
+    previous_manifest = _load_version_manifest(previous_version or {})
+    changed, added, removed, locale_stats = _compare_manifests(
+        previous_manifest, current_manifest
+    )
+
+    fingerprint_payload = json.dumps(
+        current_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    fingerprint = hashlib.sha256(fingerprint_payload).hexdigest()
+    captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    manifest_relative_path = os.path.join(
+        "data", "version_manifests", f"{_version_filename(version_tag)}.json"
+    ).replace(os.sep, "/")
+    manifest_path = os.path.join(REPO_ROOT, manifest_relative_path)
+
+    safe_makedirs(VERSION_MANIFEST_DIR)
+    write_json(
+        manifest_path,
+        {
+            "versionTag": version_tag,
+            "capturedAt": captured_at,
+            "sourceDirectory": os.path.relpath(config_db_dir, REPO_ROOT).replace(os.sep, "/"),
+            "files": current_manifest,
+        },
+    )
+
+    diff_summary = [
+        {
+            "questTitle": locale,
+            "linesChanged": stats["changed"],
+            "filesChanged": stats["changed"],
+            "addedFiles": stats["added"],
+            "removedFiles": stats["removed"],
+        }
+        for locale, stats in sorted(locale_stats.items())
+    ]
+    total_bytes = sum(int(item["bytes"]) for item in current_manifest.values())
+    previous_tag = previous_version.get("versionTag") if previous_version else None
+    record = {
+        "versionTag": version_tag,
+        "versionType": "dataset",
+        "appliedAt": captured_at,
+        "author": author,
+        "commitHash": f"db-{fingerprint[:12]}",
+        "sourceFingerprint": fingerprint,
+        "sourceDatabaseCount": len(current_manifest),
+        "sourceDatabaseBytes": total_bytes,
+        "changedFiles": len(changed),
+        "addedFiles": len(added),
+        "removedFiles": len(removed),
+        "previousVersionTag": previous_tag,
+        "manifestPath": manifest_relative_path,
+        "totalLinesModified": len(changed),
+        "description": description or f"Snapshot database game {version_tag}.",
+        "diffSummary": diff_summary,
+    }
+    history = [record] + [
+        item for item in history if item.get("versionTag") != version_tag
+    ]
+    write_json(VERSION_HISTORY_FILE, history)
+
+    print(
+        f"Version {version_tag} recorded: {len(current_manifest)} databases, "
+        f"{len(changed)} changed, {len(added)} added, {len(removed)} removed."
+    )
+    return record
 
 
 def sanitize_filename(name: str, max_len: int = 80) -> str:
@@ -89,6 +279,59 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
         name = name.replace(c, "_")
     name = name.strip(". ")
     return name[:max_len] if name else "unnamed"
+
+
+def _existing_translation(item: dict) -> str:
+    for field in ("text_id", "text_id_mt", "id", "mt"):
+        value = item.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def load_existing_id_translations() -> dict[str, str]:
+    """Snapshot Indonesian text before generated output is replaced."""
+    translations: dict[str, str] = {}
+
+    def remember(key, item) -> None:
+        if not key or not isinstance(item, dict):
+            return
+        value = _existing_translation(item)
+        if value and str(key) not in translations:
+            translations[str(key)] = value
+
+    for root in (QUEST_OUTPUT_DIR, CATEGORIES_OUTPUT_DIR):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.endswith(".json"):
+                    continue
+                file_path = os.path.join(dirpath, filename)
+                try:
+                    with open(file_path, encoding="utf-8") as f:
+                        document = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+
+                if root == QUEST_OUTPUT_DIR:
+                    rows = document.get("all_lines", []) if isinstance(document, dict) else []
+                    for row in rows if isinstance(rows, list) else []:
+                        remember(row.get("text_key"), row)
+                        for option in row.get("options", []) if isinstance(row, dict) else []:
+                            remember(option.get("text_key"), option)
+                elif isinstance(document, dict):
+                    for key, item in document.items():
+                        remember(key, item)
+
+    return translations
+
+
+def apply_existing_translation(item: dict, key, translations: dict[str, str]) -> None:
+    value = translations.get(str(key)) if key else None
+    if value:
+        item["text_id"] = value
+        item["text_id_mt"] = value
 
 
 @dataclass
@@ -451,7 +694,10 @@ def _collect_flows_from_json(obj, result: set):
             name = obj['FlowListName']
             fid = obj.get('FlowId') or obj.get('FlowID') or 0
             if name:
-                result.add((name, int(fid)))
+                try:
+                    result.add((name, int(fid)))
+                except (TypeError, ValueError):
+                    pass
         for v in obj.values():
             _collect_flows_from_json(v, result)
     elif isinstance(obj, list):
@@ -507,7 +753,8 @@ def _extract_actions_from_bindata(bindata: bytes) -> list | None:
 
 
 def extract_dialogue_from_flowstate(state_key: str, bindata: bytes,
-                                    lang_packs: list[LangPack]) -> list[dict]:
+                                    lang_packs: list[LangPack],
+                                    existing_id_translations: dict[str, str]) -> tuple[list[dict], str, list[dict]]:
     actions = _extract_actions_from_bindata(bindata)
     if not actions or not isinstance(actions, list):
         return [], "Normal", []
@@ -579,6 +826,7 @@ def extract_dialogue_from_flowstate(state_key: str, bindata: bytes,
                 lang = pack.lang
                 entry[f"speaker_{lang}"] = pack.get_speaker(who_id)
                 entry[f"text_{lang}"] = pack.get_text(tid_talk)
+            apply_existing_translation(entry, tid_talk, existing_id_translations)
 
             options = item.get("Options", [])
             if options and isinstance(options, list):
@@ -610,6 +858,7 @@ def extract_dialogue_from_flowstate(state_key: str, bindata: bytes,
                         ]
                     for pack in lang_packs:
                         opt_entry[f"text_{pack.lang}"] = pack.get_text(opt_tid)
+                    apply_existing_translation(opt_entry, opt_tid, existing_id_translations)
                     parsed_options.append(opt_entry)
                 if parsed_options:
                     entry["options"] = parsed_options
@@ -623,7 +872,10 @@ def parse_flowstate_key(state_key: str) -> tuple[str, int, int] | None:
     m = re.match(r'^(.*?)_(\d+)_(\d+)$', state_key)
     if not m:
         return None
-    return m.group(1), int(m.group(2)), int(m.group(3))
+    try:
+        return m.group(1), int(m.group(2)), int(m.group(3))
+    except (TypeError, ValueError):
+        return None
 
 
 def has_available_dialogue(lines: list[dict], primary_lang: str = "zh-Hans") -> bool:
@@ -721,59 +973,282 @@ DB_TO_CATEGORY = {
     "db_handbook.db": "Handbook"
 }
 
-PREFIX_FALLBACK_CATEGORIES = {
+# Prefixes are more reliable than incidental references in unrelated ConfigDB blobs.
+# The database scan remains a fallback for keys without a known prefix.
+PREFIX_CATEGORY_OVERRIDES = {
     "Quest": "Quest",
-    "LevelPlay": "LevelPlay",
+    "QuestChapter": "Quest",
+    "QuestTree": "Quest",
+    "QuestBranch": "Quest",
+    "LevelPlay": "Activity",
     "Skill": "Skill",
     "SkillDescription": "Skill",
     "SkillTree": "Skill",
     "PassiveSkill": "Skill",
     "PhantomSkill": "Skill",
     "RoleSkillInput": "Skill",
+    "SkillInput": "Skill",
+    "ComboTeaching": "Skill",
     "Rogue": "Rogue",
     "RogueRes": "Rogue",
     "RogueBuffPool": "Rogue",
     "RogueEvent": "Rogue",
+    "RougeMiraclecreation": "Rogue",
     "Guide": "Guide",
+    "Guid": "Guide",
     "GuideFocusNew": "Guide",
     "GuideTutorial": "Guide",
     "GuideTutorialPage": "Guide",
+    "GuideTips": "Guide",
+    "Tutorial": "Guide",
     "InstanceDungeon": "Dungeon",
     "InstanceDungeonEntrance": "Dungeon",
     "Weapon": "Weapon",
     "WeaponConf": "Weapon",
     "WeaponReson": "Weapon",
-    "Condition": "Condition",
-    "ConditionGroup": "Condition",
-    "Daily": "Daily",
-    "Daliy": "Daily",
+    "WeaponSkinConf": "Weapon",
+    "KurotatoWeapon": "Weapon",
+    "Condition": "Activity",
+    "ConditionGroup": "Activity",
+    "Daily": "Activity",
+    "Daliy": "Activity",
+    "AdventureTask": "Activity",
+    "Activity": "Activity",
+    "Event": "Activity",
+    "BabelDebuff": "Activity",
     "NPC": "NPC",
     "GNNPC": "NPC",
     "STNPC": "NPC",
-    "Speaker": "Speaker",
+    "FWNPC": "NPC",
+    "GNNPCXJXY": "NPC",
+    "Speaker": "NPC",
     "Character": "Character",
-    "Event": "Event",
-    "POI": "POI",
+    "RoleInfo": "Character",
+    "RoleSkin": "Character",
+    "ResonantChain": "Character",
     "Favor": "Favor",
     "FavorWord": "Favor",
     "FavorStory": "Favor",
     "FavorGoods": "Favor",
+    "FavorRoleInfo": "Favor",
     "Item": "Item",
     "ItemInfo": "Item",
+    "KurotatoItem": "Item",
+    "KurotatoProperty": "Item",
     "Entity": "Entity",
-    "Flow": "Flow",
-    "PrefabTextItem": "UI",
-    "ErrorCode": "ErrorCode",
+    "Monster": "Monster",
+    "MonsterInfo": "Monster",
+    "MonsterPerch": "Monster",
     "Achievement": "Achievement",
-    "ComboTeaching": "ComboTeaching",
-    "InfoDisplay": "InfoDisplay",
+    "Map": "Map",
     "MapMark": "Map",
-    "ConfirmBox": "ConfirmBox",
-    "Help": "Help",
-    "HelpText": "Help",
-    "Activity": "Activity",
-    "LoadingTipsText": "LoadingTips"
+    "POI": "Map",
+    "Area": "Map",
+    "Morale": "Map",
+    "ExploreProgress": "Map",
+    "PhotoMemory": "Map",
+    "PrefabTextItem": "UI",
+    "InfoDisplay": "UI",
+    "Text": "UI",
+    "UI": "UI",
+    "ConfirmBox": "System",
+    "ErrorCode": "System",
+    "GenericPrompt": "System",
+    "LoadingTips": "System",
+    "LoadingTipsText": "System",
+    "Help": "Guide",
+    "HelpText": "Guide",
+    "Handbook": "Handbook",
+    "ItemHandBook": "Handbook",
+    "MonsterHandBook": "Handbook",
+    "PhantomHandBook": "Handbook",
+    "PhotographHandBook": "Handbook",
+    "AnimalHandBook": "Handbook",
+    "QuestHandBook": "Handbook",
+    "Chat": "Social",
+    "ChatExpression": "Social",
+    "Message": "Social",
+    "Main": "Story",
+    "MAIN": "Story",
+    "Side": "Story",
+    "SIDE": "Story",
+    "CGVideo": "Story",
+    "Flow": "Story",
 }
+
+
+def category_for_key(key: str, db_category: str | None, dialogue_prefixes: set[str]) -> tuple[str, str]:
+    """Return (category, source) using stable semantic groups."""
+    prefix = key.split("_", 1)[0] if "_" in key else key
+    if prefix in PREFIX_CATEGORY_OVERRIDES:
+        return PREFIX_CATEGORY_OVERRIDES[prefix], "prefix"
+    if prefix in dialogue_prefixes:
+        return "Story", "dialogue-prefix"
+
+    db_aliases = {
+        "LevelPlay": "Activity",
+        "Role": "Character",
+        "RoleSkin": "Character",
+        "CGVideo": "Story",
+        "ConfirmBox": "System",
+        "ErrorCode": "System",
+        "Help": "Guide",
+        "LoadingTips": "System",
+    }
+    if db_category:
+        return db_aliases.get(db_category, db_category), "database"
+    return "Other", "other"
+
+
+def _category_component(value: str) -> str:
+    if value == "<other>":
+        return "_other"
+    return sanitize_filename(value, 64)
+
+
+def _split_category_items(
+    items: dict[str, dict[str, str]],
+    path_parts: list[str],
+    token_index: int = 0,
+    depth: int = 1,
+) -> list[tuple[list[str], dict[str, dict[str, str]]]]:
+    """Recursively split key tokens while avoiding tiny or explosive leaves."""
+    if depth >= CATEGORY_MAX_DEPTH or len(items) < CATEGORY_MIN_ITEMS * 2:
+        return [(path_parts, items)]
+
+    groups: dict[str, dict[str, dict[str, str]]] = {}
+    for key, value in items.items():
+        parts = key.split("_")
+        token = parts[token_index] if token_index < len(parts) else "<other>"
+        groups.setdefault(token, {})[key] = value
+
+    if len(groups) < 2 or len(groups) > CATEGORY_MAX_CHILDREN:
+        return [(path_parts, items)]
+
+    substantial = {
+        token: group
+        for token, group in groups.items()
+        if len(group) >= CATEGORY_MIN_ITEMS
+    }
+    if len(substantial) < 2:
+        return [(path_parts, items)]
+
+    leaves: list[tuple[list[str], dict[str, dict[str, str]]]] = []
+    small: dict[str, dict[str, str]] = {}
+    for token, group in groups.items():
+        if token not in substantial:
+            small.update(group)
+            continue
+        leaves.extend(
+            _split_category_items(
+                group,
+                [*path_parts, _category_component(token)],
+                token_index + 1,
+                depth + 1,
+            )
+        )
+    if small:
+        leaves.append(([ *path_parts, "_other"], small))
+    return leaves
+
+
+def write_category_tree(grouped_keys: dict[str, dict[str, dict[str, str]]]) -> list[dict]:
+    manifest_categories: list[dict] = []
+    for category, items in sorted(grouped_keys.items()):
+        leaves = _split_category_items(items, [category], token_index=0, depth=1)
+        for path_parts, leaf_items in leaves:
+            relative_path = os.path.join(*path_parts) + ".json"
+            output_path = os.path.join(CATEGORIES_OUTPUT_DIR, relative_path)
+            safe_makedirs(os.path.dirname(output_path))
+            write_json(output_path, dict(sorted(leaf_items.items())))
+            manifest_categories.append({
+                "id": "/".join(path_parts).lower(),
+                "name": " / ".join(path_parts),
+                "path": relative_path.replace(os.sep, "/"),
+                "depth": len(path_parts),
+                "totalItems": len(leaf_items),
+                "translatedItems": sum(
+                    bool(item.get("id") or item.get("text_id") or item.get("mt"))
+                    for item in leaf_items.values()
+                ),
+            })
+            print(f"  Saved category file: {relative_path} ({len(leaf_items)} entries)")
+
+    manifest_categories.sort(key=lambda item: item["name"].casefold())
+    write_json(CATEGORIES_MANIFEST_FILE, {
+        "version": 1,
+        "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "rules": {
+            "minItems": CATEGORY_MIN_ITEMS,
+            "maxChildren": CATEGORY_MAX_CHILDREN,
+            "maxDepth": CATEGORY_MAX_DEPTH,
+        },
+        "categories": manifest_categories,
+    })
+    return manifest_categories
+
+
+def rebuild_category_index(manifest_categories: list[dict]) -> None:
+    """Refresh only category search tables; preserve quest/editor tables."""
+    if not os.path.isfile(INDEX_DB_FILE):
+        print(f"  Category index skipped; index does not exist: {INDEX_DB_FILE}")
+        return
+    database: sqlite3.Connection | None = None
+    try:
+        database = sqlite3.connect(INDEX_DB_FILE)
+        database.executescript("""
+            DROP TABLE IF EXISTS category_text_idx;
+            DROP TABLE IF EXISTS categories;
+            CREATE VIRTUAL TABLE category_text_idx USING fts5(
+                category UNINDEXED,
+                key UNINDEXED,
+                prefix UNINDEXED,
+                text_zh,
+                text_en,
+                text_ja,
+                text_id,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );
+            CREATE TABLE categories (
+                name TEXT PRIMARY KEY,
+                file TEXT NOT NULL,
+                key_count INTEGER NOT NULL,
+                translated_count INTEGER NOT NULL
+            );
+        """)
+        rows = []
+        metadata = []
+        for category in manifest_categories:
+            file_path = os.path.join(CATEGORIES_OUTPUT_DIR, category["path"])
+            with open(file_path, encoding="utf-8") as category_file:
+                document = json.load(category_file)
+            category_name = category["name"]
+            for key, item in document.items():
+                rows.append((
+                    category_name,
+                    key,
+                    key.split("_", 1)[0] if "_" in key else key,
+                    item.get("zh-Hans", item.get("zh", "")),
+                    item.get("en", ""),
+                    item.get("ja", ""),
+                    item.get("id", item.get("text_id", item.get("mt", ""))),
+                ))
+            metadata.append((
+                category_name,
+                category["path"],
+                category["totalItems"],
+                category["translatedItems"],
+            ))
+        database.executemany("INSERT INTO category_text_idx VALUES (?,?,?,?,?,?,?)", rows)
+        database.executemany("INSERT INTO categories VALUES (?,?,?,?)", metadata)
+        database.commit()
+        database.close()
+        database = None
+        print(f"  Rebuilt category search index: {len(rows)} rows")
+    except (OSError, sqlite3.Error, json.JSONDecodeError) as exc:
+        if database is not None:
+            database.close()
+        raise RuntimeError(f"Failed rebuilding category index: {exc}") from exc
 
 
 def build_tid_to_db_map(all_keys: set) -> dict[str, str]:
@@ -785,6 +1260,7 @@ def build_tid_to_db_map(all_keys: set) -> dict[str, str]:
     db_files = glob.glob(os.path.join(base_dir, "*.db"))
     
     tid_pattern = re.compile(r'\b[a-zA-Z][a-zA-Z0-9_]{3,80}\b')
+    tid_pattern_bytes = re.compile(rb'\b[a-zA-Z][a-zA-Z0-9_]{3,80}\b')
     key_to_category = {}
     
     # Exclude extremely large voxel/preload databases to keep execution fast
@@ -829,11 +1305,13 @@ def build_tid_to_db_map(all_keys: set) -> dict[str, str]:
                         if isinstance(val, str):
                             strings_to_check.append(val)
                         elif isinstance(val, bytes):
-                            try:
-                                decoded = val.decode('utf-8', errors='ignore')
-                                strings_to_check.extend(tid_pattern.findall(decoded))
-                            except Exception:
-                                pass
+                            # ConfigDB FlatBuffers contain ASCII TidKeys inside arbitrary
+                            # binary data; scan the bytes directly instead of lossy UTF-8
+                            # decoding the entire blob first.
+                            strings_to_check.extend(
+                                match.decode('ascii')
+                                for match in tid_pattern_bytes.findall(val)
+                            )
                         
                         for s in strings_to_check:
                             if s in all_keys:
@@ -859,16 +1337,58 @@ def build_tid_to_db_map(all_keys: set) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Export grouped Wuthering Waves text and record a database version."
+    )
+    parser.add_argument(
+        "config_db_dir",
+        nargs="?",
+        help="ConfigDB/WuwaDBExport directory (defaults to data/db_exports).",
+    )
+    parser.add_argument(
+        "--version",
+        dest="version_tag",
+        help="Game data version tag to record, for example v3.5 or v3.6.",
+    )
+    parser.add_argument(
+        "--author",
+        default="WuwaID Data Pipeline",
+        help="Author recorded in the version history.",
+    )
+    parser.add_argument(
+        "--description",
+        help="Optional description for the recorded game data version.",
+    )
+    parser.add_argument(
+        "--record-only",
+        action="store_true",
+        help="Record database fingerprints without regenerating WebUI data.",
+    )
+    args = parser.parse_args()
+
+    if args.record_only and not args.version_tag:
+        parser.error("--record-only requires --version")
+
     print("=" * 60)
     print("  Wuthering Waves Text Exporter (Grouped & Ordered)")
     print("=" * 60)
 
     global CONFIG_DB_DIR
-    cli_dir = sys.argv[1] if len(sys.argv) > 1 else None
-    CONFIG_DB_DIR = resolve_config_db_dir(cli_dir)
+    CONFIG_DB_DIR = resolve_config_db_dir(args.config_db_dir)
     print(f"Config DB dir: {CONFIG_DB_DIR}")
     if not os.path.isdir(CONFIG_DB_DIR):
         raise FileNotFoundError(f"Config DB directory does not exist: {CONFIG_DB_DIR}")
+
+    source_manifest = build_db_manifest(CONFIG_DB_DIR) if args.version_tag else None
+    if args.record_only:
+        record_data_version(
+            CONFIG_DB_DIR,
+            args.version_tag,
+            args.author,
+            args.description,
+            source_manifest,
+        )
+        return
 
     # -----------------------------------------------------------------------
     # Part 1: Quest-Ordered Dialogue Export
@@ -954,9 +1474,14 @@ def main():
     for list_name, state_id in state_index.keys():
         fl_fids.setdefault(list_name, set()).add(state_id)
 
-    # Re-create cleanly the output folders
-    if os.path.isdir(OUTPUT_DIR):
-        shutil.rmtree(OUTPUT_DIR)
+    existing_id_translations = load_existing_id_translations()
+    print(f"Preserving {len(existing_id_translations)} existing Indonesian translations.")
+
+    # Re-create only exporter-owned folders. WebUI derives index.db and
+    # chapters.json in OUTPUT_DIR; deleting the parent makes it fall back to
+    # mock data and silently hides real chapters.
+    for generated_dir in (QUEST_OUTPUT_DIR, CATEGORIES_OUTPUT_DIR):
+        safe_rmtree(generated_dir)
     safe_makedirs(OUTPUT_DIR)
     safe_makedirs(QUEST_OUTPUT_DIR)
     safe_makedirs(CATEGORIES_OUTPUT_DIR)
@@ -1010,7 +1535,7 @@ def main():
                     flow_states = []
                     for state_key, _, bindata in sorted(entries, key=lambda x: (x[1], x[0])):
                         lines, plot_mode, state_actions = extract_dialogue_from_flowstate(
-                            state_key, bindata, lang_packs
+                            state_key, bindata, lang_packs, existing_id_translations
                         )
                         flow_lines.extend(lines)
                         flow_states.append({
@@ -1053,8 +1578,7 @@ def main():
                     "all_lines": all_lines,
                 }
                 out_path = os.path.join(q_dir, "dialogue.json")
-                with open(out_path, "w", encoding="utf-8") as f:
-                    json.dump(output, f, ensure_ascii=False, indent=2)
+                write_json(out_path, output)
 
         if not ch_nodes:
             try:
@@ -1092,7 +1616,7 @@ def main():
             flow_states = []
             for state_key, _, bindata in sorted(entries, key=lambda x: (x[1], x[0])):
                 lines, plot_mode, state_actions = extract_dialogue_from_flowstate(
-                    state_key, bindata, lang_packs
+                    state_key, bindata, lang_packs, existing_id_translations
                 )
                 flow_lines.extend(lines)
                 flow_states.append({
@@ -1129,8 +1653,7 @@ def main():
             "all_lines": all_lines,
         }
         out_path = os.path.join(q_dir, "dialogue.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, ensure_ascii=False, indent=2)
+        write_json(out_path, output)
 
         side_count += 1
 
@@ -1164,29 +1687,24 @@ def main():
     # Build database-driven category map
     key_to_db_category = build_tid_to_db_map(all_keys)
 
-    # Group all keys into categories
-    grouped_keys: dict[str, dict[str, dict[str, str]]] = {} # category -> key -> lang -> content
-    
+    # Group all keys into stable semantic categories. Dialogue keys are excluded
+    # from this directory because they already have their own quest export.
+    grouped_keys: dict[str, dict[str, dict[str, str]]] = {}
+    dialogue_prefixes = {
+        key.split("_", 1)[0] for key in exported_dialogue_keys if "_" in key
+    }
     dialogue_exclusions_count = 0
-    fallback_categories_count = 0
-    db_categories_count = 0
+    category_sources = {"prefix": 0, "dialogue-prefix": 0, "database": 0, "other": 0}
 
     for key in sorted(all_keys):
-        # Apply Dialogue Exclusion
         if key in exported_dialogue_keys:
             dialogue_exclusions_count += 1
             continue
 
-        # Determine Category
-        category = key_to_db_category.get(key)
-        
-        if category:
-            db_categories_count += 1
-        else:
-            # Fallback to Prefix
-            prefix = key.split('_')[0] if '_' in key else "NoPrefix"
-            category = PREFIX_FALLBACK_CATEGORIES.get(prefix, prefix)
-            fallback_categories_count += 1
+        category, source = category_for_key(
+            key, key_to_db_category.get(key), dialogue_prefixes
+        )
+        category_sources[source] += 1
 
         # Retrieve translations
         translations = {}
@@ -1194,6 +1712,10 @@ def main():
             content = pack.get_text(key)
             if content:
                 translations[pack.lang] = content
+        existing_id = existing_id_translations.get(key)
+        if existing_id:
+            translations["id"] = existing_id
+            translations["text_id"] = existing_id
 
         if not translations:
             continue
@@ -1201,44 +1723,31 @@ def main():
         grouped_keys.setdefault(category, {})[key] = translations
 
     print(f"  Dialogue Keys Excluded: {dialogue_exclusions_count}")
-    print(f"  Keys Mapped via DB Scan: {db_categories_count}")
-    print(f"  Keys Mapped via Fallback Prefix: {fallback_categories_count}")
+    print(f"  Keys grouped by source: {category_sources}")
 
-    # Save to categories files
-    # Clean up minor groups and merge into others.json if count < 50 keys
-    major_groups: dict[str, dict] = {}
-    others_group: dict[str, dict] = {}
-
-    for cat, keys_dict in grouped_keys.items():
-        if len(keys_dict) >= 50:
-            major_groups[cat] = keys_dict
-        else:
-            # Merge small ones into others
-            for k, val in keys_dict.items():
-                others_group[k] = val
-
-    # Save major groups
-    for cat, keys_dict in sorted(major_groups.items()):
-        out_file = os.path.join(CATEGORIES_OUTPUT_DIR, f"{cat}.json")
-        with open(out_file, "w", encoding="utf-8") as f:
-            json.dump(keys_dict, f, ensure_ascii=False, indent=2)
-        print(f"  Saved category file: {cat}.json ({len(keys_dict)} entries)")
-
-    # Save others group
-    if others_group:
-        out_file = os.path.join(CATEGORIES_OUTPUT_DIR, "others.json")
-        with open(out_file, "w", encoding="utf-8") as f:
-            json.dump(others_group, f, ensure_ascii=False, indent=2)
-        print(f"  Saved category file: others.json ({len(others_group)} entries)")
+    # Write a bounded recursive tree. The manifest is the stable contract for
+    # the WebUI; consumers do not need to guess category paths from filenames.
+    manifest_categories = write_category_tree(grouped_keys)
+    rebuild_category_index(manifest_categories)
 
     print(f"\n{'='*60}")
     print("Grouped Text Export Complete!")
     print(f"  Output folder: {OUTPUT_DIR}")
-    print(f"  Subdirectories:")
+    print("  Subdirectories:")
     print(f"    - Quest dialogue: {QUEST_OUTPUT_DIR}")
     print(f"    - Category JSONs: {CATEGORIES_OUTPUT_DIR}")
-    print(f"  Total Category files created: {len(major_groups) + (1 if others_group else 0)}")
-    print(f"=" * 60)
+    print(f"    - Category manifest: {CATEGORIES_MANIFEST_FILE}")
+    print(f"  Total Category files created: {len(manifest_categories)}")
+    print("=" * 60)
+
+    if args.version_tag:
+        record_data_version(
+            CONFIG_DB_DIR,
+            args.version_tag,
+            args.author,
+            args.description,
+            source_manifest,
+        )
 
 
 if __name__ == "__main__":

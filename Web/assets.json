@@ -4,12 +4,12 @@
     {
       "name": "bgm.mp3",
       "url": "https://raw.githubusercontent.com/TitoTFP/WuwaID/refs/heads/main/Web/Audio/bgm.mp3",
-      "sha256": "fca7653b0ffd03d38a70661f6373277927e4dd77466d4666b479972fb463a92d"
+      "sha256": "67e32fcd7356631c19aa2c86784a2c3395db6292965e4fd32175891290c95e65"
     },
     {
       "name": "bg-video.mp4",
       "url": "https://raw.githubusercontent.com/TitoTFP/WuwaID/refs/heads/main/Web/Video/bg-video.mp4",
-      "sha256": "2d01c99d9fc568ae0ae6046423b081d2ee5ea56b5cf47922913fe0c23bacd953"
+      "sha256": "8c2283ef358b4a776e2f342249b5050f829d17ae87bfe6126a1b3d8cca621d1f"
     }
   ]
 }

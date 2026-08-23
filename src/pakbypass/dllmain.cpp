@@ -21,6 +21,8 @@
 #include "SDK/Basic.cpp"
 #include "DynamicResolver.hpp"
 
+#include <exception>
+
 namespace SDK
 {
     class FName UKismetStringLibrary::Conv_StringToName(const class FString& InString)
@@ -53,7 +55,10 @@ static bool CheckMountPak()
 static bool ProcessPakFiles(const std::string& folderPath)
 {
     if (!fs::exists(folderPath) || !fs::is_directory(folderPath))
+    {
+        LOG_WARN("Pak", "Folder khong ton tai: %s", folderPath.c_str());
         return false;
+    }
 
     int order = 46;
     bool found = false;
@@ -85,6 +90,51 @@ static std::string GetDllDirectory(HMODULE hModule)
     return fs::path(buffer).parent_path().string();
 }
 
+using InitializeExporterFromLoaderFn = BOOL (WINAPI*) (
+    uintptr_t gobjectsAddress,
+    uintptr_t namePoolAddress,
+    uint32_t namePoolBlockOffsetBits,
+    uint32_t namePoolHeaderOffset,
+    uint32_t namePoolStringOffset,
+    uint32_t namePoolEntryStride,
+    uint32_t namePoolLengthShift,
+    uintptr_t appendStringAddress,
+    int32_t processEventIdx,
+    int32_t processEventRva);
+
+static bool InitializeExporterFromLoader(HMODULE exporter)
+{
+    auto initialize = reinterpret_cast<InitializeExporterFromLoaderFn>(
+        GetProcAddress(exporter, "WuwaIDInitializeFromLoader"));
+    if (!initialize)
+    {
+        LOG_ERROR("Init", "Exporter does not expose loader handoff (error: %lu)",
+            GetLastError());
+        return false;
+    }
+
+    const SDK::NamePool::Layout namePool = SDK::NamePool::GetLayout();
+    const uintptr_t gobjectsAddress = reinterpret_cast<uintptr_t>(
+        SDK::UObject::GObjects.GetTypedPtr());
+    const uintptr_t appendStringAddress = reinterpret_cast<uintptr_t>(
+        SDK::FName::AppendString);
+
+    const BOOL initialized = initialize(
+        gobjectsAddress,
+        namePool.PoolAddress,
+        namePool.BlockOffsetBits,
+        namePool.HeaderOffset,
+        namePool.StringOffset,
+        namePool.EntryStride,
+        namePool.LengthShift,
+        appendStringAddress,
+        SDK::Offsets::ProcessEventIdx,
+        SDK::Offsets::ProcessEvent);
+
+    LOG_INFO("Init", "Exporter loader handoff: %s", initialized ? "accepted" : "rejected");
+    return initialized == TRUE;
+}
+
 // Logging adapter for DynamicResolver
 static void ResolverLog(const char* fmt, ...)
 {
@@ -101,14 +151,19 @@ static HMODULE g_hModule = nullptr;
 
 static void DoInit()
 {
-#ifdef _DEBUG
-    Logger::Instance().Initialize();
-#endif
+    if (!Logger::Instance().Initialize())
+        OutputDebugStringA("[WuwaID] Failed to initialize pakbypass logger\n");
 
+    LOG_INFO("Init", "Log file: %s", Logger::Instance().GetLogPath().c_str());
     LOG_INFO("Init", "Dang cho game khoi tao...");
+    LOG_INFO("Init", "Loader module: %p", g_hModule);
+    LOG_INFO("Init", "Real winhttp.dll: %s (%p)",
+        WinhttpProxy::g_realDll ? "loaded" : "not loaded",
+        WinhttpProxy::g_realDll);
 
-    // Phase 1: Dynamically resolve SDK offsets (GObjects, AppendString, ProcessEventIdx)
-    // Uses Dumper-7 strategies: .data section scanning, string XREF, VTable analysis
+    // Phase 1: Dynamically resolve SDK offsets (GObjects, FNamePool,
+    // AppendString fallback, ProcessEventIdx).
+    // Uses Dumper-7 strategies plus direct name-pool validation.
     if (!DynamicResolver::ResolveAndInitSDK(120, ResolverLog, SDK::UObject::GObjects, 2000))
     {
         LOG_ERROR("Init", "Khong the tim offset SDK!");
@@ -128,17 +183,27 @@ static void DoInit()
     LOG_INFO("Init", "Game da san sang!");
 
     fs::path dllDir = GetDllDirectory(g_hModule);
+    LOG_INFO("Init", "DLL directory: %s", dllDir.string().c_str());
 
     // Load export_localization_db.dll if present
     fs::path locDll = dllDir / "export_localization_db.dll";
     if (fs::exists(locDll))
     {
+        LOG_INFO("Init", "Found exporter: %s", locDll.string().c_str());
         HMODULE hLoc = LoadLibraryW(locDll.wstring().c_str());
         if (hLoc)
+        {
+            InitializeExporterFromLoader(hLoc);
             LOG_INFO("Init", "Loaded: export_localization_db.dll");
+        }
         else
-            LOG_WARN("Init", "export_localization_db.dll load that bai (error: %lu)", GetLastError());
+        {
+            DWORD error = GetLastError();
+            LOG_ERROR("Init", "export_localization_db.dll load that bai (error: %lu)", error);
+        }
     }
+    else
+        LOG_WARN("Init", "Khong tim thay exporter: %s", locDll.string().c_str());
 
     fs::path pakDir = dllDir / "wuwaIndonesia";
     std::string pakPath = pakDir.string();
@@ -158,16 +223,24 @@ static void DoInit()
         LOG_ERROR("Done", "Khong tim thay file .pak trong: %s", pakPath.c_str());
     }
 
-#ifdef _DEBUG
     Logger::Instance().Flush();
-#endif
 }
 
 // Thread pool callback — looks far more legitimate than raw CreateThread
-static VOID CALLBACK InitWorker(PTP_CALLBACK_INSTANCE /*Instance*/, PVOID /*Context*/, PTP_WORK Work)
+static VOID CALLBACK InitWorker(PTP_CALLBACK_INSTANCE /*Instance*/, PVOID /*Context*/, PTP_WORK /*Work*/)
 {
-    DoInit();
-    CloseThreadpoolWork(Work);
+    try
+    {
+        DoInit();
+    }
+    catch (const std::exception& error)
+    {
+        LOG_ERROR("Init", "Unhandled C++ exception: %s", error.what());
+    }
+    catch (...)
+    {
+        LOG_ERROR("Init", "Unhandled exception in initialization worker");
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
@@ -177,11 +250,23 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         g_hModule = hModule;
-        WinhttpProxy::LoadRealDll();
+        if (!WinhttpProxy::LoadRealDll())
+        {
+            char message[128];
+            snprintf(message, sizeof(message),
+                "[WuwaID] Failed to load system winhttp.dll (error: %lu)\n",
+                GetLastError());
+            OutputDebugStringA(message);
+        }
         {
             PTP_WORK work = CreateThreadpoolWork(InitWorker, nullptr, nullptr);
             if (work)
+            {
                 SubmitThreadpoolWork(work);
+                CloseThreadpoolWork(work);
+            }
+            else
+                OutputDebugStringA("[WuwaID] Failed to create initialization worker\n");
         }
         break;
 
